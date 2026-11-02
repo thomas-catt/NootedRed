@@ -45,6 +45,15 @@
 #include <mach/i386/vm_types.h>
 #include <pexpert/pexpert.h>
 
+static const UInt8 kDceDriverSetBacklightPattern[] = {
+    0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50, 0x41, 0x89, 0xF0,
+    0x40, 0x89, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x7F, 0x08, 0x40, 0x8B, 0x40, 0x28, 0x8B, 0x70, 0x10};
+static const UInt8 kDceDriverSetBacklightPatternMask[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0,
+    0xF0, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0, 0xFF, 0xF0, 0xFF, 0xFF, 0xFF, 0xFF};
+
 static const UInt8 kLinkCreatePattern[]     = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
                                                0x53, 0x48, 0x81, 0xEC, 0x00, 0x03, 0x00, 0x00, 0x49, 0x89, 0xFD, 0x48,
                                                0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x00, 0x48, 0x00, 0x00,
@@ -127,6 +136,14 @@ void Backlight::processKext(KernelPatcher& patcher, const size_t id, const mach_
             kDcLinkSetBacklightLevelNitsPattern, kDcLinkSetBacklightLevelNitsPatternMask};
         PANIC_COND(!solveRequest.solve(patcher, id, slide, size), "Backlight",
                    "Failed to resolve dc_link_set_backlight_level_nits");
+
+        if (currentKernelVersion() >= MACOS_11 && !NRed::singleton().getAttributes().isRenoir()) {
+            PenguinWizardry::PatternSolveRequest dceSolveRequest{
+                "_dce_driver_set_backlight", this->orgDceDriverSetBacklight, kDceDriverSetBacklightPattern,
+                kDceDriverSetBacklightPatternMask};
+            PANIC_COND(!dceSolveRequest.solve(patcher, id, slide, size), "Backlight",
+                       "Failed to resolve dce_driver_set_backlight");
+        }
         PenguinWizardry::PatternRouteRequest requests[] = {
             {"_link_create", wrapLinkCreate, this->orgLinkCreate, kLinkCreatePattern, kLinkCreatePatternMask},
             {"__ZN35AMDRadeonX6000_AmdRadeonFramebuffer25setAttributeForConnectionEijm", wrapSetAttributeForConnection,
@@ -179,15 +196,25 @@ bool Backlight::OnAppleBacklightDisplayLoad(void* const, void* const, IOService*
 IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, const IOIndex connectIndex,
                                                   const IOSelect attribute, const uintptr_t value)
 {
-    const auto ret = FunctionCast(wrapSetAttributeForConnection, singleton().orgSetAttributeForConnection)(
-        framebuffer, connectIndex, attribute, value);
-    if (attribute != kIOAppleBacklightAttribute) { return ret; }
+    if (attribute != kIOAppleBacklightAttribute) {
+        return FunctionCast(wrapSetAttributeForConnection, singleton().orgSetAttributeForConnection)(
+            framebuffer, connectIndex, attribute, value);
+    }
 
     singleton().curBacklightLvl = static_cast<UInt32>(value);
 
-    if (singleton().embeddedPanelLink == nullptr) { return kIOReturnNoDevice; }
+    // CRITICAL: NEVER return kIOReturnNoDevice to AppleBacklightDisplay during early wake/power transitions!
+    // Returning kIOReturnNoDevice causes AppleBacklightDisplay to permanently detach, resulting in a dark
+    // screen and the illegal action sound on brightness hotkeys.
+    if (singleton().embeddedPanelLink == nullptr) { return kIOReturnSuccess; }
 
-    if (singleton().maxBacklightLvl == 0) { return kIOReturnInternalError; }
+    if (singleton().maxBacklightLvl == 0) { return kIOReturnSuccess; }
+
+    void* panelCntl = singleton().panelCntlPtr;
+    if (panelCntl == nullptr && singleton().embeddedPanelLink != nullptr) {
+        panelCntl                = getMember<void*>(singleton().embeddedPanelLink, 0x150);
+        singleton().panelCntlPtr = panelCntl;
+    }
 
     const auto percentage = singleton().curBacklightLvl * 100 / singleton().maxBacklightLvl;
 
@@ -197,6 +224,15 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
             return kIOReturnSuccess;
         }
     }
+    else if (!NRed::singleton().getAttributes().isRenoir() && panelCntl != nullptr
+             && singleton().orgDceDriverSetBacklight != nullptr)
+    {
+        // Direct DCE Panel Control PWM for Raven/Picasso (DCN 1.0).
+        // Directly writes to the hardware panel inverter, completely bypassing DMCU ABM (VariBright).
+        const auto pwmValue = percentage >= 100 ? 0x1FF00 : ((percentage * 0xFF) / 100) << 8U;
+        singleton().orgDceDriverSetBacklight(panelCntl, pwmValue);
+        return kIOReturnSuccess;
+    }
     else {
         const auto pwmValue = (percentage * 0xFFFF) / 100;
         if (singleton().orgDcLinkSetBacklightLevel(singleton().embeddedPanelLink, pwmValue, 0)) {
@@ -204,16 +240,17 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
         }
     }
 
-    return kIOReturnDeviceError;
+    return kIOReturnSuccess;
 }
 
 IOReturn Backlight::wrapGetAttributeForConnection(IOService* framebuffer, IOIndex connectIndex, IOSelect attribute,
                                                   uintptr_t* value)
 {
-    const auto ret = FunctionCast(wrapGetAttributeForConnection, singleton().orgGetAttributeForConnection)(
-        framebuffer, connectIndex, attribute, value);
-    if (attribute != kIOAppleBacklightAttribute) { return ret; }
-    *value = singleton().curBacklightLvl;
+    if (attribute != kIOAppleBacklightAttribute) {
+        return FunctionCast(wrapGetAttributeForConnection, singleton().orgGetAttributeForConnection)(
+            framebuffer, connectIndex, attribute, value);
+    }
+    if (value != nullptr) { *value = singleton().curBacklightLvl; }
     return kIOReturnSuccess;
 }
 
@@ -225,7 +262,10 @@ void* Backlight::wrapLinkCreate(void* data)
     const auto signalType = getMember<UInt32>(ret, 0x38);
     switch (signalType) {
         case SIGNAL_TYPE_LVDS: {
-            if (singleton().embeddedPanelLink == nullptr) { singleton().embeddedPanelLink = ret; }
+            if (singleton().embeddedPanelLink == nullptr) {
+                singleton().embeddedPanelLink = ret;
+                singleton().panelCntlPtr      = getMember<void*>(ret, 0x150);
+            }
             else {
                 SYSLOG("Backlight", "Found multiple embedded panel links. This may be a bug. Please report this.");
             }
@@ -233,6 +273,7 @@ void* Backlight::wrapLinkCreate(void* data)
         case SIGNAL_TYPE_EDP: {
             if (singleton().embeddedPanelLink == nullptr) {
                 singleton().embeddedPanelLink = ret;
+                singleton().panelCntlPtr      = getMember<void*>(ret, 0x150);
                 const auto& linkCaps          = singleton().dcLinkCapsField(ret);
                 // TODO: PWM should be used for SDR mode on LCD HDR panels,
                 // but AUX for HDR mode. Linux doesn't support HDR properly,

@@ -310,6 +310,15 @@ void X6000FB::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t s
             this->orgCreateRegisterAccess};
         PANIC_COND(!patcher.routeMultiple(id, &request, 1, slide, size), "X6000FB",
                    "Failed to route createRegisterAccess");
+
+        KernelPatcher::RouteRequest apuStabilityRequests[] = {
+            {"__ZN32AMDRadeonX6000_AmdRegisterAccess15validateHwStateEjjj", wrapValidateHwState,
+             this->orgValidateHwState},
+            {"__ZN34AMDRadeonX6000_AmdRadeonController6notifyE19_AmdControllerEventPv", wrapNotify, this->orgNotify},
+            {"__ZNK34AMDRadeonX6000_AmdRadeonController15isEGPUSupportedEv", wrapIsEGPUSupported},
+        };
+        PANIC_COND(!patcher.routeMultiple(id, apuStabilityRequests, slide, size), "X6000FB",
+                   "Failed to route APU stability requests");
     }
 
     if (NRed::singleton().getAttributes().isRenoir()) {
@@ -599,10 +608,41 @@ UInt32 X6000FB::wrapControllerPowerUp(void* const self)
 {
     auto& m_flags  = getMember<UInt8>(self, 0x5F18);
     auto  send     = (m_flags & 2) == 0;
-    m_flags       |= 4;    // All framebuffers enabled
+    m_flags       |= 0xC;    // All framebuffers enabled (4) + Hardware attached (8)
     auto ret       = FunctionCast(wrapControllerPowerUp, singleton().orgControllerPowerUp)(self);
     if (send) { singleton().orgMessageAccelerator(self, IOFBRequestControllerEnabled, nullptr, nullptr, nullptr); }
     return ret;
+}
+
+UInt32 X6000FB::wrapValidateHwState(void* const self, const UInt32 reg, const UInt32 val, const UInt32 expectedVal)
+{
+    if (val == 0xFFFFFFFF) {
+        // Suppress surprise removal and ensure hardware state remains marked valid (offset 0x38BC is m_hwStateValid).
+        // On APUs, registers polled before GPU powerUp completes return 0xFFFFFFFF;
+        // letting AMDRadeonX6000Framebuffer handle this would trigger an eGPU surpriseRemoval,
+        // permanently detaching all display pipes.
+        getMember<UInt8>(self, 0x38BC) = 1;
+        DBGLOG("X6000FB", "wrapValidateHwState: Suppressed surprise removal for reg 0x%X", reg);
+        return 0;
+    }
+    return FunctionCast(wrapValidateHwState, singleton().orgValidateHwState)(self, reg, val, expectedVal);
+}
+
+IOReturn X6000FB::wrapNotify(void* const self, const UInt32 event, void* const param)
+{
+    // Event 7 is _AmdControllerEvent::SurpriseRemoval.
+    // An APU is integrated onto the CPU silicon and cannot be physically removed from the PCI bus.
+    if (event == 7) {
+        DBGLOG("X6000FB", "wrapNotify: Suppressed SurpriseRemoval event on APU");
+        return kIOReturnSuccess;
+    }
+    return FunctionCast(wrapNotify, singleton().orgNotify)(self, event, param);
+}
+
+bool X6000FB::wrapIsEGPUSupported(const void* const self)
+{
+    // APUs are always internal integrated GPUs, never eGPUs.
+    return false;
 }
 
 void X6000FB::wrapDpReceiverPowerCtrl(void* const link, const bool powerOn)

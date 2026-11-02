@@ -43,6 +43,8 @@ class Backlight
     IONotifier*                   dispNotif{nullptr};
     void*                         embeddedPanelLink{nullptr};
     bool                          supportsAUX{false};
+    t_DceDriverSetBacklight       orgDceDriverSetBacklight{nullptr};
+    void*                         panelCntlPtr{nullptr};
     mach_vm_address_t             orgLinkCreate{0};
     t_DcLinkSetBacklightLevel     orgDcLinkSetBacklightLevel{0};
     t_DcLinkSetBacklightLevelNits orgDcLinkSetBacklightLevelNits{0};

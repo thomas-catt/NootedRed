@@ -54,6 +54,8 @@ class X6000FB
     readBiosImage_t*       readPciAtomBiosImage{nullptr};
     validateBiosImage_t*   validateAtomBiosImage{nullptr};
     mach_vm_address_t      orgCreatePspDirectory{0};
+    mach_vm_address_t      orgValidateHwState{0};
+    mach_vm_address_t      orgNotify{0};
 
 public:
     static X6000FB& singleton();
@@ -82,4 +84,7 @@ private:
     static size_t   readVramAtomBiosImage(void* self, UInt8* buffer, size_t bufferSize);
     static IOReturn readAtomBios(void* self);
     static AmdAtomPspDirectory* wrapCreatePspDirectory(AmdAtomFwHelper* biosHelper, UInt32 tableOffset);
+    static UInt32               wrapValidateHwState(void* self, UInt32 reg, UInt32 val, UInt32 expectedVal);
+    static IOReturn             wrapNotify(void* self, UInt32 event, void* param);
+    static bool                 wrapIsEGPUSupported(const void* self);
 };
