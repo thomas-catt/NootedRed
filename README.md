@@ -1,7 +1,5 @@
 # NootedRed ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/NootedRed/main.yml?branch=master&logo=github&style=for-the-badge) [![Release Badge](https://img.shields.io/github/v/release/ChefKissInc/NootedRed?include_prereleases&style=for-the-badge&sort=semver&color=blue)](https://github.com/ChefKissInc/NootedRed/releases) [![Downloads Badge](https://img.shields.io/github/downloads/ChefKissInc/NootedRed/total?style=for-the-badge)](https://github.com/ChefKissInc/NootedRed/releases/latest)
 
----
-
 ## about my fork
 this fork focuses on fixes for specific issues i encountered with this kext, for my own hardware (a picasso 3500U APU). i don't intend to distribute this as an alternative development for NootedRed since i have almost no OS/kernel programming knowledge of my own, and the fixes obtained are through use of AI which the original project does not endorse (i'm only learning about mac kernel development if anything). so far i have achieved:
 - fixed backlight adjustment (fixed AMD ABM/Vari-Bright interference)
