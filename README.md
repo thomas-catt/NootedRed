@@ -1,4 +1,15 @@
-# NootedRed ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/NootedRed/main.yml?branch=master&logo=github&style=for-the-badge) [![Release Badge](https://img.shields.io/github/v/release/ChefKissInc/NootedRed?include_prereleases&style=for-the-badge&sort=semver&color=blue)](https://github.com/ChefKissInc/NootedRed/releases) [![Downloads Badge](https://img.shields.io/github/downloads/ChefKissInc/NootedRed/total?style=for-the-badge)](https://github.com/ChefKissInc/NootedRed/releases/latest) ![Written by humans, not AI](https://img.shields.io/badge/written_by_humans-not_ai-blue?style=for-the-badge)
+# NootedRed ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/NootedRed/main.yml?branch=master&logo=github&style=for-the-badge) [![Release Badge](https://img.shields.io/github/v/release/ChefKissInc/NootedRed?include_prereleases&style=for-the-badge&sort=semver&color=blue)](https://github.com/ChefKissInc/NootedRed/releases) [![Downloads Badge](https://img.shields.io/github/downloads/ChefKissInc/NootedRed/total?style=for-the-badge)](https://github.com/ChefKissInc/NootedRed/releases/latest)
+
+---
+
+## about my fork
+this fork focuses on fixes for specific issues i encountered with this kext, for my own hardware (a picasso 3500U APU). i don't intend to distribute this as an alternative development for NootedRed since i have almost no OS/kernel programming knowledge of my own, and the fixes obtained are through use of AI which the original project does not endorse (i'm only learning about mac kernel development if anything). so far i have achieved:
+- fixed backlight adjustment (fixed AMD ABM/Vari-Bright interference)
+- fixed sleep wake (obtained via disabling `surpriseRemoval` trigger for late GPU entry)
+
+i will try my best to see how far i can go with further stabilizing this kext for my machine and document the findings here. now for the rest of the original README, see below.
+
+---
 
 > [!CAUTION]
 > Please consider donating: donations help me stay alive and pay costs; if the Hackintosh projects don't receive funding, I will (have to) stop working on them.
