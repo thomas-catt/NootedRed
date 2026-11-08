@@ -1,0 +1,50 @@
+
+#include <cassert>
+#include <optional>
+#include <PenguinWizardry/KernelVersion.hpp>
+#include <cstring>
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <set>
+#include <string>
+#include <array>
+#include <vector>
+#include <MetalPatch/Runtime.hpp>
+#include <MetalPatch/Data/Surface.hpp>
+#include <MetalPatch/Resolver.hpp>
+#include <MetalPatch/Transaction.hpp>
+#include <MetalPatch/PatchPlan.hpp>
+using user_addr_t=uint64_t;using mach_vm_address_t=uint64_t;using mach_vm_size_t=uint64_t;
+using vm_map_t=void*;using task_t=void*;using proc_t=void*;using natural_t=unsigned;
+using mach_msg_type_number_t=unsigned;using vm_prot_t=int;using kern_return_t=int;
+struct vm_region_submap_info_data_64_t {int protection=0,max_protection=0,is_submap=0;unsigned object_id=0;
+ unsigned char share_mode=0;unsigned short shadow_depth=0;};
+using vm_region_submap_short_info_data_64_t=vm_region_submap_info_data_64_t;using vm_region_recurse_info_t=int*;
+constexpr unsigned PAGE_SIZE=4096,VM_REGION_SUBMAP_SHORT_INFO_COUNT_64=12;
+constexpr int TRUE=1,FALSE=0,KERN_SUCCESS=0,KERN_INVALID_ARGUMENT=4,KERN_FAILURE=5;
+constexpr int VM_PROT_NONE=0,VM_PROT_READ=1,VM_PROT_WRITE=2,VM_PROT_EXECUTE=4,VM_PROT_COPY=16;
+#define SYSLOG(...) ((void)0)
+template<typename T,size_t N>constexpr size_t arrsize(const T(&)[N]){return N;}
+static std::map<std::string,unsigned> properties;
+struct NRed {static NRed& singleton(){static NRed n;return n;}void setProp32(const char* k,unsigned v){properties[k]=v;}
+ unsigned getDeviceID(){return device; }static unsigned device;};unsigned NRed::device=0x1638;
+struct Version{unsigned major(){return majorValue;}unsigned minor(){return minorValue;}static unsigned majorValue,minorValue;};unsigned Version::majorValue=25;unsigned Version::minorValue=6;
+const PenguinWizardry::KernelVersion& currentKernelVersion(){static std::optional<PenguinWizardry::KernelVersion> current;return current.emplace(Version::majorValue,Version::minorValue);}
+static bool flag=true,fvrcEnabled=true;static bool checkKernelArgument(const char* s){
+ assert(strcmp(s,"-NRedVideoFix")==0||strcmp(s,"-NRedNoFVRC")==0);
+ if(strcmp(s,"-NRedNoFVRC")==0)return !fvrcEnabled;
+ return flag;}
+#define IONew(T,N) (new T[N])
+#define IODelete(P,T,N) delete[] P
+constexpr int KERN_RESOURCE_SHORTAGE=3;
+struct KernelPatcher{
+ static constexpr int KernelID=0;int solves=0,routes=0;bool missing=false,routeOK=true;
+ static inline UInt8 destroyCode[16]{};
+ static void destroy(vm_map_t){}
+ struct RouteRequest{const char* symbol;uint64_t from=0,*org;template<typename T,typename O>RouteRequest(const char* s,T,O& o):symbol(s),org(reinterpret_cast<uint64_t*>(&o)) {}};
+ uint64_t solveSymbol(int,const char* s){solves++;return missing?0:(strcmp(s,"_vm_map_destroy")==0?reinterpret_cast<uint64_t>(destroyCode):1);}void clearError(){}
+ bool routeMultipleLong(int,RouteRequest* request,int count){assert(count==1);routes++;if(routeOK&&strcmp(request->symbol,"_vm_map_destroy")==0)*request->org=reinterpret_cast<uint64_t>(destroy);return routeOK;}
+};
+static task_t current_task(){return reinterpret_cast<void*>(1);}
+static void* current_thread(){static thread_local char identity;return &identity;}

@@ -1,15 +1,14 @@
-# NootedRed ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/NootedRed/main.yml?branch=master&logo=github&style=for-the-badge) [![Release Badge](https://img.shields.io/github/v/release/ChefKissInc/NootedRed?include_prereleases&style=for-the-badge&sort=semver&color=blue)](https://github.com/ChefKissInc/NootedRed/releases) [![Downloads Badge](https://img.shields.io/github/downloads/ChefKissInc/NootedRed/total?style=for-the-badge)](https://github.com/ChefKissInc/NootedRed/releases/latest)
-
----
-
-## about my fork
-this fork focuses on fixes for specific issues i encountered with this kext, for my own hardware (a picasso 3500U APU). i don't intend to distribute this as an alternative development for NootedRed since i have almost no OS/kernel programming knowledge of my own, and the fixes obtained are through use of AI which the original project does not endorse (i'm only learning about mac kernel development if anything). so far i have achieved:
-- fixed backlight adjustment (fixed AMD ABM/Vari-Bright interference)
-- fixed sleep wake (obtained via disabling `surpriseRemoval` trigger for late GPU entry)
+## NootedRed: about my fork
+this fork focuses on fixes for specific issues i encountered with this kext, for my own hardware (a picasso 3500U APU). i don't intend to distribute this as an alternative development for NootedRed since i have almost no OS/kernel programming knowledge of my own, and all of the fixes obtained are through use of AI which the original project does not endorse (i'm only learning about mac kernel development if anything). so far i have achieved:
+- **fixed backlight adjustment:** fixed AMD ABM/Vari-Bright interference
+- **fixed sleep wake:** obtained via disabling eGPU `surpriseRemoval` trigger for late GPU entry
+- **fixed chromium crashes:** first attempt at fixing infamous chrome crashes has successfully made chrome usable with fine-to-good perforance. done under `MetalPatch`, the fix incorporates several `steve12311`'s Metal fixes and patches ([steve12311/NootedRed pre-release.15](https://github.com/steve12311/NootedRed/tree/690e6c528e59adfa0f0daf12628bf2f1bb4cf8bb)). the patch is only enabled for Sequoia for now, as its application on other OSes is not tested. [read about the MetalPatch, documented by AI here](docs/MetalPatch.md).
 
 i will try my best to see how far i can go with further stabilizing this kext for my machine and document the findings here. now for the rest of the original README, see below.
 
 ---
+# NootedRed ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/ChefKissInc/NootedRed/main.yml?branch=master&logo=github&style=for-the-badge) [![Release Badge](https://img.shields.io/github/v/release/ChefKissInc/NootedRed?include_prereleases&style=for-the-badge&sort=semver&color=blue)](https://github.com/ChefKissInc/NootedRed/releases) [![Downloads Badge](https://img.shields.io/github/downloads/ChefKissInc/NootedRed/total?style=for-the-badge)](https://github.com/ChefKissInc/NootedRed/releases/latest)
+
 
 > [!CAUTION]
 > Please consider donating: donations help me stay alive and pay costs; if the Hackintosh projects don't receive funding, I will (have to) stop working on them.

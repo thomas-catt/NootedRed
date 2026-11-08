@@ -1,0 +1,672 @@
+// Resolve compatible Metal patch sites without modifying process memory.
+#pragma once
+#include <MetalPatch/Data/Constructor.hpp>
+#include <MetalPatch/Data/Sequoia.hpp>
+#include <MetalPatch/Data/Sequoia24H23.hpp>
+#include <MetalPatch/Data/Sonoma.hpp>
+#include <MetalPatch/Data/Surface.hpp>
+#include <MetalPatch/ResolutionCache.hpp>
+#include <MetalPatch/SharedCache.hpp>
+#include <string.h>
+
+namespace MetalPatch::Resolver
+{
+
+    using namespace MetalPatch::Data;
+    using MetalPatch::SharedCache::Image;
+    using MetalPatch::SharedCache::Input;
+    using MetalPatch::SharedCache::MaxTextSize;
+    using MetalPatch::SharedCache::Range;
+    using MetalPatch::SharedCache::Reader;
+    using MetalPatch::SharedCache::relativeTarget;
+    using MetalPatch::SharedCache::setRelative;
+    using MetalPatch::SharedCache::UserLimit;
+    using MetalPatch::SharedCache::word;
+    struct Plan
+    {
+        static constexpr UInt32 BufferSize = MetalPatch::SequoiaData::MaxPatchSize;
+        static_assert(BufferSize >= MetalPatch::SonomaData::MaxPatchSize);
+        static_assert(BufferSize >= MetalPatch::Data::MaxPatchSize && BufferSize <= 512);
+        MetalPatch::Data::Patch                patches[4]{};
+        UInt8                                  original[4][BufferSize]{};
+        UInt8                                  patched[4][BufferSize]{};
+        UInt32                                 reads{0};
+        Input                                  input{nullptr, {}};
+        Image                                  image;
+        UInt8                                  scan[Input::ScanSize];
+        MetalPatch::CacheResolver::ImageBounds scratchImages[sizeof(ScratchResolverData::ResolverImages)
+                                                             / sizeof(ScratchResolverData::ResolverImages[0])]{};
+        MetalPatch::CacheResolver::ImageBounds
+            constructorImages[sizeof(MetalPatch::ConstructorData::ResolverImages)
+                              / sizeof(MetalPatch::ConstructorData::ResolverImages[0])]{};
+        MetalPatch::CacheResolver::ImageBounds sequoiaImages[sizeof(MetalPatch::SequoiaData::ResolverImages)
+                                                             / sizeof(MetalPatch::SequoiaData::ResolverImages[0])]{};
+    };
+
+    struct InputBudget
+    {
+        UInt32 reads, bytes, candidates;
+        bool   failed;
+    };
+
+    inline InputBudget saveBudget(const Input& input)
+    { return {input.reads, input.bytes, input.candidates, input.failed}; }
+
+    inline void restoreBudget(Input& input, const InputBudget& budget)
+    {
+        input.reads      = budget.reads;
+        input.bytes      = budget.bytes;
+        input.candidates = budget.candidates;
+        input.failed     = budget.failed;
+    }
+
+    inline bool imageBounds(const Image& image, MetalPatch::CacheResolver::ImageBounds& bounds)
+    {
+        if (image.segmentCount > 8) { return false; }
+        bounds.address      = image.address;
+        bounds.text         = image.text;
+        bounds.segmentCount = image.segmentCount;
+        for (UInt32 i = 0; i < image.segmentCount; ++i) { bounds.segments[i] = image.segments[i]; }
+        return true;
+    }
+
+    inline bool imageForCache(Input& input, UInt64 base, Image& image)
+    {
+        return MetalPatch::SharedCache::imageForCache(input, base, image, DriverPath, sizeof(DriverPath))
+               && image.constantCount != 0 && image.text.size <= MaxTextSize;
+    }
+
+    inline bool skipped(UInt32 index, const RelativeField* fields, UInt32 fieldCount)
+    {
+        for (UInt32 i = 0; i < fieldCount; ++i) {
+            if (index >= fields[i].offset && index - fields[i].offset < 4) { return true; }
+        }
+        return false;
+    }
+
+    inline bool matches(Input& input, UInt64 address, const UInt8* expected, UInt32 size,
+                        const RelativeField* fields = nullptr, UInt32 fieldCount = 0, bool blend = false)
+    {
+        return MetalPatch::CacheResolver::matchBytes(input, address, size,
+                                                     [&](UInt32 index, UInt8 value)
+                                                     {
+                                                         return skipped(index, fields, fieldCount)
+                                                                || (blend && index >= BlendGateInConstructor
+                                                                    && index - BlendGateInConstructor < 2)
+                                                                || value == expected[index];
+                                                     });
+    }
+
+    inline bool findFunction(Input& input, const Range& text, const UInt8* expected, UInt32 size, UInt64& found,
+                             bool blend = false, UInt64 hint = 0)
+    {
+        if (size < 32) { return false; }
+        MetalPatch::CacheResolver::Prefix prefix;
+        for (UInt32 i = 0; i < 32; ++i) { prefix.set(i, expected[i], false); }
+        MetalPatch::CacheResolver::ScanAnchor anchor{};
+        const bool                            anchored = prefix.commonAnchor(prefix, anchor);
+        return MetalPatch::CacheResolver::scanFunction(
+            input, text, size, 32, [&](const UInt8* bytes) { return memcmp(bytes, expected, 32) == 0; },
+            [&](UInt64 address) { return matches(input, address, expected, size, nullptr, 0, blend); }, found, hint,
+            anchored ? &anchor : nullptr);
+    }
+
+    // Scratch 子解析器：4 个映像、1 个完整函数、1 个补丁位置。
+    inline bool resolveScratch(Input& input, UInt64 base, const DevicePatchSet& device, Plan& plan,
+                               MetalPatch::Validation::FastResolution* fast)
+    {
+        using namespace ScratchResolverData;
+        constexpr auto Images    = sizeof(ResolverImages) / sizeof(ResolverImages[0]);
+        constexpr auto Functions = sizeof(ResolverFunctions) / sizeof(ResolverFunctions[0]);
+        static_assert(Images <= 16 && Functions <= 32);
+        auto& bounds = plan.scratchImages;
+        if (!MetalPatch::CacheResolver::resolveImages(input, base, ResolverImages, bounds)) { return false; }
+        UInt32 functionImages[Functions]{};
+        for (UInt32 i = 0; i < Functions; ++i) { functionImages[i] = ResolverFunctions[i].image; }
+        MetalPatch::CacheResolver::KnownLocation known[Functions]{};
+        const auto                               budget = saveBudget(input);
+        if (fast) {
+            fast->restart();
+            if (fast->observeImages(input.cache.address, input.cache.size, bounds, ResolverImages, Images)
+                && fast->lookup(MetalPatch::Validation::FunctionGroup::DisplayScratch, functionImages, Functions,
+                                known))
+            {
+                if (MetalPatch::CacheResolver::resolveFunctions(
+                        input, base, ResolverImages, ResolverFunctions, device.scratch + 3, ResolverLocations,
+                        plan.patches + 3, &plan.original[3][0], &plan.patched[3][0], Plan::BufferSize, bounds, true,
+                        nullptr, 0, known, nullptr))
+                {
+                    return true;
+                }
+                restoreBudget(input, budget);
+                fast->rejectHot();
+            }
+        }
+        MetalPatch::CacheResolver::KnownLocation located[Functions]{};
+        if (!MetalPatch::CacheResolver::resolveFunctions(input, base, ResolverImages, ResolverFunctions,
+                                                         device.scratch + 3, ResolverLocations, plan.patches + 3,
+                                                         &plan.original[3][0], &plan.patched[3][0], Plan::BufferSize,
+                                                         bounds, true, nullptr, 0, nullptr, located))
+        {
+            return false;
+        }
+        if (fast) {
+            fast->publish(MetalPatch::Validation::FunctionGroup::DisplayScratch, located, functionImages, Functions);
+        }
+        return true;
+    }
+
+    // 构造器子解析器：4 个映像、1 个完整函数、1 个补丁位置。
+    inline bool resolveConstructor(Input& input, UInt64 base, Plan& plan, MetalPatch::Validation::FastResolution* fast)
+    {
+        using namespace MetalPatch::ConstructorData;
+        constexpr auto Images    = sizeof(ResolverImages) / sizeof(ResolverImages[0]);
+        constexpr auto Functions = sizeof(ResolverFunctions) / sizeof(ResolverFunctions[0]);
+        static_assert(Images <= 16 && Functions <= 32);
+        auto& bounds = plan.constructorImages;
+        if (!MetalPatch::CacheResolver::resolveImages(input, base, ResolverImages, bounds)) { return false; }
+        UInt32 functionImages[Functions]{};
+        for (UInt32 i = 0; i < Functions; ++i) { functionImages[i] = ResolverFunctions[i].image; }
+        MetalPatch::CacheResolver::KnownLocation known[Functions]{};
+        const auto                               budget = saveBudget(input);
+        if (fast) {
+            fast->restart();
+            if (fast->observeImages(input.cache.address, input.cache.size, bounds, ResolverImages, Images)
+                && fast->lookup(MetalPatch::Validation::FunctionGroup::DisplayConstructor, functionImages, Functions,
+                                known))
+            {
+                if (MetalPatch::CacheResolver::resolveFunctions(
+                        input, base, ResolverImages, ResolverFunctions, MetalPatch::ConstructorData::Patches,
+                        ResolverLocations, plan.patches + 2, &plan.original[2][0], &plan.patched[2][0],
+                        Plan::BufferSize, bounds, true, nullptr, 0, known, nullptr))
+                {
+                    return true;
+                }
+                restoreBudget(input, budget);
+                fast->rejectHot();
+            }
+        }
+        MetalPatch::CacheResolver::KnownLocation located[Functions]{};
+        if (!MetalPatch::CacheResolver::resolveFunctions(input, base, ResolverImages, ResolverFunctions,
+                                                         MetalPatch::ConstructorData::Patches, ResolverLocations,
+                                                         plan.patches + 2, &plan.original[2][0], &plan.patched[2][0],
+                                                         Plan::BufferSize, bounds, true, nullptr, 0, nullptr, located))
+        {
+            return false;
+        }
+        if (fast) {
+            fast->publish(MetalPatch::Validation::FunctionGroup::DisplayConstructor, located, functionImages,
+                          Functions);
+        }
+        return true;
+    }
+
+    inline bool resolve(Input& input, UInt64 base, const DevicePatchSet& device, bool shared, bool blend, Plan& plan,
+                        bool scratchMode = false, MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        auto& image = plan.image;
+        memset(&image, 0, sizeof(image));
+        // Scratch 按完整函数和实际相对引用核验。
+        if (scratchMode && !resolveScratch(input, base, device, plan, fast)) { return false; }
+        if (!imageForCache(input, base, image)) { return false; }
+
+        constexpr UInt32 MaxCoreFunctions       = 5;
+        const UInt32     TotalFunctions         = scratchMode ? 4 : 5;
+        const UInt32     SettingsIndex          = 0;
+        const UInt32     StandaloneScratchIndex = 1;
+        const UInt32     InitIndex              = scratchMode ? 1 : 2;
+        const UInt32     OverrideIndex          = scratchMode ? 2 : 3;
+        const UInt32     ConstructorIndex       = scratchMode ? 3 : 4;
+
+        UInt64               settings{0}, scratch{0}, constructor{0}, init{0}, overrideAddress{0}, targets[3]{};
+        bool                 constructorDirect{false};
+        const UInt8* const   variants[]  = {Original0, device.immediate[0].patched, device.shared[0].patched};
+        const RelativeField* links[]     = {OriginalInitLinks, ImmediateInitLinks, SharedInitLinks};
+        const auto           matchInitAt = [&](UInt64 address, UInt64* result)
+        {
+            if (!image.text.contains(address, sizeof(Original0))) { return false; }
+            UInt8 initBytes[sizeof(Original0)];
+            for (UInt32 variant = 0; variant < 3; ++variant) {
+                if (!matches(input, address, variants[variant], sizeof(Original0), links[variant], 3)
+                    || !input.read(address, initBytes, sizeof(initBytes)))
+                {
+                    continue;
+                }
+                UInt64 candidateTargets[3]{};
+                bool   valid = true;
+                for (UInt32 k = 0; k < 3; ++k) {
+                    valid &= relativeTarget(address, links[variant][k].offset, initBytes,
+                                            candidateTargets[links[variant][k].target]);
+                }
+                UInt8 constant[4];
+                valid = valid && candidateTargets[1] == settings && image.constant(candidateTargets[0])
+                        && input.read(candidateTargets[0], constant, sizeof(constant)) && word(constant) == 0x40400000
+                        && image.text.contains(candidateTargets[2], sizeof(NativeDump))
+                        && matches(input, candidateTargets[2], NativeDump, sizeof(NativeDump));
+                if (valid) {
+                    memcpy(result, candidateTargets, sizeof(candidateTargets));
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto matchOverrideAt = [&](UInt64 address)
+        {
+            UInt8 bytes[sizeof(Original1)];
+            if (!image.text.contains(address, sizeof(bytes)) || !input.read(address, bytes, sizeof(bytes))) {
+                return false;
+            }
+            const bool original = memcmp(bytes, Original1, 6) == 0;
+            const bool patched  = bytes[0] == 0xE9 && memcmp(bytes + 5, Patched1 + 5, 5) == 0;
+            UInt64     target{0};
+            return (original || patched) && relativeTarget(address, original ? 6 : 1, bytes, target)
+                   && target == (original ? settings : init + OverrideEntryInInit);
+        };
+
+        UInt32                                   functionImages[MaxCoreFunctions]{};
+        MetalPatch::CacheResolver::KnownLocation known[MaxCoreFunctions]{};
+        const auto                               budget = saveBudget(input);
+        bool                                     hot    = false;
+        if (fast) {
+            fast->restart();
+            MetalPatch::CacheResolver::ImageBounds          bounds{};
+            const MetalPatch::CacheResolver::ImageReference refs[1] = {{DriverPath, sizeof(DriverPath)}};
+            if (imageBounds(image, bounds)
+                && fast->observeImages(input.cache.address, input.cache.size, &bounds, refs, 1)
+                && fast->lookup(MetalPatch::Validation::FunctionGroup::DisplayCore, functionImages, TotalFunctions,
+                                known))
+            {
+                hot                       = true;
+                const auto& settingsKnown = known[SettingsIndex];
+                if (settingsKnown.address == 0 || settingsKnown.patched
+                    || !image.text.contains(settingsKnown.address, sizeof(NativeOverride))
+                    || !matches(input, settingsKnown.address, NativeOverride, sizeof(NativeOverride)))
+                {
+                    hot = false;
+                }
+                else {
+                    settings = settingsKnown.address;
+                }
+                if (hot && !scratchMode) {
+                    const auto& scratchKnown = known[StandaloneScratchIndex];
+                    if (scratchKnown.address == 0 || scratchKnown.patched
+                        || !image.text.contains(scratchKnown.address, sizeof(ScratchOriginal))
+                        || !matches(input, scratchKnown.address, ScratchOriginal, sizeof(ScratchOriginal)))
+                    {
+                        hot = false;
+                    }
+                    else {
+                        scratch = scratchKnown.address;
+                    }
+                }
+                if (hot) {
+                    const auto& initKnown = known[InitIndex];
+                    init                  = initKnown.address;
+                    if (initKnown.address == 0 || initKnown.patched
+                        || !image.text.contains(initKnown.address, sizeof(Original0)) || !matchInitAt(init, targets))
+                    {
+                        hot = false;
+                    }
+                }
+                if (hot) {
+                    const auto& overrideKnown = known[OverrideIndex];
+                    overrideAddress           = overrideKnown.address;
+                    if (overrideKnown.address == 0 || overrideKnown.patched
+                        || !image.text.contains(overrideKnown.address, sizeof(Original1))
+                        || !matchOverrideAt(overrideAddress))
+                    {
+                        hot = false;
+                    }
+                }
+                if (hot) {
+                    const auto& constructorKnown = known[ConstructorIndex];
+                    if (constructorKnown.address != 0) {
+                        if (constructorKnown.patched
+                            || !image.text.contains(constructorKnown.address, sizeof(BlendConstructor))
+                            || !matches(input, constructorKnown.address, BlendConstructor, sizeof(BlendConstructor),
+                                        nullptr, 0, true))
+                        {
+                            hot = false;
+                        }
+                        else {
+                            constructor       = constructorKnown.address;
+                            constructorDirect = true;
+                        }
+                    }
+                }
+                if (!hot) {
+                    restoreBudget(input, budget);
+                    fast->rejectHot();
+                }
+            }
+        }
+
+        if (!hot) {
+            if (!findFunction(input, image.text, NativeOverride, sizeof(NativeOverride), settings, false,
+                              image.address + NativeOverrideRVA)
+                || (!scratchMode
+                    && !findFunction(input, image.text, ScratchOriginal, sizeof(ScratchOriginal), scratch, false,
+                                     image.address + ScratchRVA)))
+            {
+                return false;
+            }
+            if (!MetalPatch::CacheResolver::scanFunction(
+                    input, image.text, sizeof(Original0), 32,
+                    [&](const UInt8* bytes)
+                    {
+                        for (auto* variant : variants) {
+                            if (memcmp(bytes, variant, 32) == 0) { return true; }
+                        }
+                        return false;
+                    },
+                    [&](UInt64 address) { return matchInitAt(address, targets); }, init, image.address + InitRVA))
+            {
+                return false;
+            }
+            if (!MetalPatch::CacheResolver::scanFunction(
+                    input, image.text, sizeof(Original1), sizeof(Original1),
+                    [&](const UInt8* bytes)
+                    {
+                        return memcmp(bytes, Original1, 6) == 0
+                               || (bytes[0] == 0xE9 && memcmp(bytes + 5, Patched1 + 5, 5) == 0);
+                    },
+                    matchOverrideAt, overrideAddress, image.address + OverrideRVA))
+            {
+                return false;
+            }
+            constructorDirect = findFunction(input, image.text, BlendConstructor, sizeof(BlendConstructor), constructor,
+                                             true, image.address + ConstructorRVA);
+            if (fast) {
+                MetalPatch::CacheResolver::KnownLocation locations[MaxCoreFunctions]{};
+                locations[SettingsIndex] = {settings, false};
+                if (!scratchMode) { locations[StandaloneScratchIndex] = {scratch, false}; }
+                locations[InitIndex]     = {init, false};
+                locations[OverrideIndex] = {overrideAddress, false};
+                const UInt32 count       = constructorDirect ? TotalFunctions : TotalFunctions - 1;
+                if (constructorDirect) { locations[ConstructorIndex] = {constructor, false}; }
+                fast->publish(MetalPatch::Validation::FunctionGroup::DisplayCore, locations, functionImages, count);
+            }
+            if (!constructorDirect) {
+                if (!resolveConstructor(input, base, plan, fast)) { return false; }
+                constructor = base + plan.patches[2].offset - BlendGateInConstructor;
+            }
+        }
+        else if (!constructorDirect) {
+            if (!resolveConstructor(input, base, plan, fast)) { return false; }
+            constructor = base + plan.patches[2].offset - BlendGateInConstructor;
+        }
+
+        const auto* source =
+            scratchMode ? device.scratch : (blend ? device.blend : (shared ? device.shared : device.immediate));
+        const auto* patchedLinks = shared || blend ? SharedInitLinks : ImmediateInitLinks;
+        memcpy(plan.original[0], Original0, sizeof(Original0));
+        memcpy(plan.patched[0], source[0].patched, sizeof(Original0));
+        for (UInt32 k = 0; k < 3; ++k) {
+            if (!setRelative(plan.original[0], OriginalInitLinks[k].offset, init, targets[OriginalInitLinks[k].target])
+                || !setRelative(plan.patched[0], patchedLinks[k].offset, init, targets[patchedLinks[k].target]))
+            {
+                return false;
+            }
+        }
+        memcpy(plan.original[1], Original1, sizeof(Original1));
+        memcpy(plan.patched[1], Patched1, sizeof(Patched1));
+        if (!setRelative(plan.original[1], 6, overrideAddress, settings)
+            || !setRelative(plan.patched[1], 1, overrideAddress, init + OverrideEntryInInit))
+        {
+            return false;
+        }
+        memcpy(plan.original[2], BlendGateOriginal, sizeof(BlendGateOriginal));
+        memcpy(plan.patched[2], BlendGatePatched, sizeof(BlendGatePatched));
+        const UInt64 addresses[] = {init, overrideAddress, constructor + BlendGateInConstructor};
+        for (UInt32 i = 0; i < 3; ++i) {
+            const auto length = i == 0 ? sizeof(Original0) : (i == 1 ? sizeof(Original1) : sizeof(BlendGateOriginal));
+            if (!input.cache.contains(addresses[i], length)) { return false; }
+            plan.patches[i] = {addresses[i] - base, plan.original[i], plan.patched[i], static_cast<UInt32>(length)};
+        }
+        plan.reads = input.reads;
+        return true;
+    }
+
+    inline bool resolve(Reader reader, UInt64 base, const DevicePatchSet& device, bool shared, bool blend, Plan& plan,
+                        bool scratchMode = false, MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        plan.input            = {reader, {}};
+        plan.input.scanBuffer = plan.scan;
+        return resolve(plan.input, base, device, shared, blend, plan, scratchMode, fast);
+    }
+
+    template<size_t Images, size_t Functions, size_t Locations>
+    inline bool resolveProfile(Input& input, UInt64 base, const MetalPatch::Data::Patch* patches, Plan& plan,
+                               const MetalPatch::CacheResolver::ImageReference (&ResolverImages)[Images],
+                               const MetalPatch::CacheResolver::Function       (&ResolverFunctions)[Functions],
+                               const MetalPatch::CacheResolver::Location       (&ResolverLocations)[Locations],
+                               MetalPatch::Validation::FastResolution*         fast)
+    {
+        if (!patches) { return false; }
+        static_assert(Locations == 4);
+        static_assert(Images <= sizeof(plan.sequoiaImages) / sizeof(plan.sequoiaImages[0]) && Functions <= 32);
+        auto& bounds = plan.sequoiaImages;
+        if (!MetalPatch::CacheResolver::resolveImages(input, base, ResolverImages, bounds)) { return false; }
+        UInt32 functionImages[Functions]{};
+        for (UInt32 i = 0; i < Functions; ++i) { functionImages[i] = ResolverFunctions[i].image; }
+        MetalPatch::CacheResolver::KnownLocation known[Functions]{};
+        MetalPatch::CacheResolver::KnownLocation located[Functions]{};
+        const auto                               budget = saveBudget(input);
+        bool                                     hot    = false;
+        if (fast) {
+            fast->restart();
+            hot = fast->observeImages(input.cache.address, input.cache.size, bounds, ResolverImages, Images)
+                  && fast->lookup(MetalPatch::Validation::FunctionGroup::DisplaySequoia, functionImages, Functions,
+                                  known);
+        }
+        bool resolved =
+            hot
+            && MetalPatch::CacheResolver::resolveFunctions(
+                input, base, ResolverImages, ResolverFunctions, patches, ResolverLocations, plan.patches,
+                &plan.original[0][0], &plan.patched[0][0], Plan::BufferSize, bounds, false, nullptr, 0, known, nullptr);
+        if (!resolved && hot) {
+            restoreBudget(input, budget);
+            fast->rejectHot();
+            hot = false;
+        }
+        if (!resolved) {
+            resolved = MetalPatch::CacheResolver::resolveFunctions(
+                input, base, ResolverImages, ResolverFunctions, patches, ResolverLocations, plan.patches,
+                &plan.original[0][0], &plan.patched[0][0], Plan::BufferSize, bounds, false, nullptr, 0, nullptr,
+                located);
+        }
+        if (!resolved) { return false; }
+        const auto& init = ResolverFunctions[0];
+        UInt64      constant{0}, dump{0};
+        UInt8       value[4], dumpBytes[sizeof(NativeDump)];
+        const auto  address   = base + plan.patches[0].offset;
+        const auto  postCheck = [&]
+        {
+            return relativeTarget(address, init.originalRefs[0].offset, plan.original[0], constant)
+                   && input.read(constant, value, sizeof(value)) && word(value) == 0x40400000
+                   && relativeTarget(address, init.originalRefs[2].offset, plan.original[0], dump)
+                   && input.read(dump, dumpBytes, sizeof(dumpBytes))
+                   && memcmp(dumpBytes, NativeDump, sizeof(NativeDump)) == 0;
+        };
+        if (!postCheck()) {
+            if (!hot) { return false; }
+            restoreBudget(input, budget);
+            fast->rejectHot();
+            hot = false;
+            if (!MetalPatch::CacheResolver::resolveFunctions(input, base, ResolverImages, ResolverFunctions, patches,
+                                                             ResolverLocations, plan.patches, &plan.original[0][0],
+                                                             &plan.patched[0][0], Plan::BufferSize, bounds, false,
+                                                             nullptr, 0, nullptr, located)
+                || !postCheck())
+            {
+                return false;
+            }
+        }
+        if (!hot && fast) {
+            fast->publish(MetalPatch::Validation::FunctionGroup::DisplaySequoia, located, functionImages, Functions);
+        }
+        plan.reads = input.reads;
+        return true;
+    }
+
+    inline bool resolveMetal(Input& input, UInt64 base, UInt32 deviceID, Plan& plan, UInt32 major,
+                             MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        if (major == 23) {
+            return resolveProfile(input, base, MetalPatch::SonomaData::findDevice(deviceID), plan,
+                                  MetalPatch::SonomaData::ResolverImages, MetalPatch::SonomaData::ResolverFunctions,
+                                  MetalPatch::SonomaData::ResolverLocations, fast);
+        }
+        if (major == 24) {
+            UInt8 uuid[16];
+            if (deviceID == 0x15D8 && input.reader && input.reader(base + 88, uuid, sizeof(uuid)) == 0
+                && memcmp(uuid, MetalPatch::Sequoia24H23::CacheUUID, sizeof(uuid)) == 0)
+            {
+                return resolveProfile(input, base, MetalPatch::SequoiaData::findDevice(deviceID), plan,
+                                      MetalPatch::SequoiaData::ResolverImages, MetalPatch::Sequoia24H23::Functions,
+                                      MetalPatch::SequoiaData::ResolverLocations, fast);
+            }
+            return resolveProfile(input, base, MetalPatch::SequoiaData::findDevice(deviceID), plan,
+                                  MetalPatch::SequoiaData::ResolverImages, MetalPatch::SequoiaData::ResolverFunctions,
+                                  MetalPatch::SequoiaData::ResolverLocations, fast);
+        }
+        const auto* device = MetalPatch::Data::findDevice(deviceID);
+        return major == 25 && device && resolve(input, base, *device, true, true, plan, true, fast);
+    }
+
+    inline bool resolveSequoia(Input& input, UInt64 base, UInt32 deviceID, Plan& plan,
+                               MetalPatch::Validation::FastResolution* fast = nullptr)
+    { return resolveMetal(input, base, deviceID, plan, 24, fast); }
+
+    inline bool resolveSequoia(Reader reader, UInt64 base, UInt32 deviceID, Plan& plan,
+                               MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        plan.input            = {reader, {}};
+        plan.input.scanBuffer = plan.scan;
+        return resolveSequoia(plan.input, base, deviceID, plan, fast);
+    }
+
+    inline bool resolveSubmitProfile(Input& input, UInt64 base, UInt64& offset,
+                                     const MetalPatch::CacheResolver::Function&       fn,
+                                     const MetalPatch::CacheResolver::ImageReference* ResolverImages,
+                                     bool sectionRelative, MetalPatch::Validation::FastResolution* fast)
+    {
+        Image image;
+        if (!imageForCache(input, base, image)) { return false; }
+        if (image.segmentCount > 8 || fn.size < 32) { return false; }
+        MetalPatch::CacheResolver::ImageBounds bounds{};
+        if (!imageBounds(image, bounds)) { return false; }
+        const MetalPatch::CacheResolver::ImageReference refs[1]           = {{DriverPath, sizeof(DriverPath)}};
+        UInt32                                          functionImages[1] = {0};
+        MetalPatch::CacheResolver::KnownLocation        known[1]{};
+        const auto                                      budget = saveBudget(input);
+        MetalPatch::CacheResolver::Prefix               prefixes[2];
+        for (UInt32 variant = 0; variant < 2; ++variant) {
+            for (UInt32 i = 0; i < 32; ++i) {
+                static constexpr UInt8 jump[6]   = {0xFF, 0x25, 0, 0, 0, 0};
+                const bool             entryByte = variant && i < 15;
+                const bool             relocated =
+                    i >= 15 && MetalPatch::CacheResolver::skipped(i, fn.originalRefs, fn.originalCount);
+                const bool masked = entryByte ? i >= 6 && i < 14 : relocated;
+                prefixes[variant].set(i, entryByte ? (i < 6 ? jump[i] : 0x90) : fn.original[i], masked);
+            }
+        }
+        MetalPatch::CacheResolver::ScanAnchor anchor{};
+        const bool                            anchored = prefixes[0].commonAnchor(prefixes[1], anchor);
+        UInt64                                found{0};
+        const auto                            candidate = [&](UInt64 address)
+        {
+            UInt8 entry[15];
+            if (!input.read(address, entry, sizeof(entry))) { return false; }
+            const bool installed = memcmp(entry, "\xff\x25\0\0\0\0", 6) == 0 && entry[14] == 0x90;
+            if (!MetalPatch::CacheResolver::matchBytes(input, address, fn.size,
+                                                       [&](UInt32 i, UInt8 value)
+                                                       {
+                                                           return (installed && i < sizeof(entry))
+                                                                  || MetalPatch::CacheResolver::skipped(
+                                                                      i, fn.originalRefs, fn.originalCount)
+                                                                  || value == fn.original[i];
+                                                       }))
+            {
+                return false;
+            }
+            for (UInt32 r = 0; r < fn.originalCount; ++r) {
+                const auto& ref = fn.originalRefs[r];
+                UInt8       field[4];
+                UInt64      target{0}, expected{0};
+                if (ref.indirect || ref.image != 0 || !input.read(address + ref.offset, field, 4)
+                    || !relativeTarget(address + ref.offset, 0, field, target) || !image.contains(target, 4)
+                    || !MetalPatch::CacheResolver::target(input, ref, &bounds, 1, ResolverImages, &fn, &address, 1,
+                                                          expected, sectionRelative)
+                    || target != expected)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        bool hot = false;
+        if (fast) {
+            fast->restart();
+            hot = fast->observeImages(input.cache.address, input.cache.size, &bounds, refs, 1)
+                  && fast->lookup(MetalPatch::Validation::FunctionGroup::DisplaySubmit, functionImages, 1, known);
+        }
+        if (hot) {
+            if (known[0].address != 0 && !known[0].patched && image.text.contains(known[0].address, fn.size)
+                && candidate(known[0].address))
+            {
+                offset = known[0].address - base;
+                return true;
+            }
+            restoreBudget(input, budget);
+            fast->rejectHot();
+        }
+        if (!MetalPatch::CacheResolver::scanFunction(
+                input, image.text, fn.size, 32,
+                [&](const UInt8* bytes) { return prefixes[0].matches(bytes) || prefixes[1].matches(bytes); }, candidate,
+                found, 0, anchored ? &anchor : nullptr))
+        {
+            return false;
+        }
+        offset = found - base;
+        if (fast) {
+            MetalPatch::CacheResolver::KnownLocation located[1] = {{found, false}};
+            fast->publish(MetalPatch::Validation::FunctionGroup::DisplaySubmit, located, functionImages, 1);
+        }
+        return true;
+    }
+
+    inline bool resolveSubmitForOS(Input& input, UInt64 base, UInt64& offset, UInt32 major,
+                                   MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        if (major == 23) {
+            return resolveSubmitProfile(input, base, offset, MetalPatch::SonomaData::Submit::ResolverFunctions[0],
+                                        MetalPatch::SonomaData::Submit::ResolverImages, false, fast);
+        }
+        if (major == 24) {
+            return resolveSubmitProfile(input, base, offset, MetalPatch::SequoiaData::Submit::ResolverFunctions[0],
+                                        MetalPatch::SequoiaData::Submit::ResolverImages, false, fast);
+        }
+        return major == 25
+               && resolveSubmitProfile(input, base, offset, MetalPatch::ConstructorData::Submit::ResolverFunctions[0],
+                                       MetalPatch::ConstructorData::Submit::ResolverImages, true, fast);
+    }
+
+    inline bool resolveSubmit(Input& input, UInt64 base, UInt64& offset, bool sectionRelative,
+                              MetalPatch::Validation::FastResolution* fast = nullptr)
+    { return resolveSubmitForOS(input, base, offset, sectionRelative ? 25 : 24, fast); }
+
+    inline bool resolveSubmit(Reader reader, UInt64 base, UInt64& offset, bool sectionRelative,
+                              MetalPatch::Validation::FastResolution* fast = nullptr)
+    {
+        Input input{reader, {}};
+        return resolveSubmit(input, base, offset, sectionRelative, fast);
+    }
+
+    inline bool resolveSequoiaSubmit(Reader reader, UInt64 base, UInt64& offset)
+    { return resolveSubmit(reader, base, offset, false); }
+
+    inline bool resolveTahoeSubmit(Reader reader, UInt64 base, UInt64& offset)
+    { return resolveSubmit(reader, base, offset, true); }
+
+}    // namespace MetalPatch::Resolver

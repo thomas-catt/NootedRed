@@ -59,3 +59,7 @@ compile_commands.json
 ### clangd
 # Cache
 .cache/
+
+### Python test caches
+__pycache__/
+*.pyc

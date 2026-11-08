@@ -40,6 +40,7 @@
 #include <IOKit/IOTypes.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <Kexts.hpp>
+#include <MetalPatch.hpp>
 #include <NRed.hpp>
 #include <PenguinWizardry/RuntimeMC.hpp>
 #include <Regs/GC.hpp>
@@ -76,6 +77,7 @@ void NRed::init()
         [](void* const, KernelPatcher& patcher)
         {
             singleton().processPatcher();
+            MetalPatch::init(patcher);
             DriverInjector::singleton().processPatcher(patcher);
             PenguinWizardry::RuntimeMCManager::singleton().processPatcher(patcher);
         },

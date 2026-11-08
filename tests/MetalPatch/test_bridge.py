@@ -1,0 +1,160 @@
+"""编译真实 Metal 桥接，验证六种核显的动态 Scratch。"""
+from pathlib import Path
+from memory_harness import with_memory_helpers
+import subprocess
+import sys
+import re
+
+ROOT = Path(__file__).resolve().parents[2]
+SONOMA = '--sonoma' in sys.argv
+LEGACY = SONOMA or '--sequoia' in sys.argv
+WORK = ROOT / ('build/dynamic-cache/sonoma-compute' if SONOMA else 'build/dynamic-cache/sequoia-compute' if '--sequoia' in sys.argv else 'build/dynamic-cache/compute')
+
+
+def main():
+    stub = WORK / 'stubs/IOKit'
+    stub.mkdir(parents=True, exist_ok=True)
+    (stub / 'IOTypes.h').write_text('#pragma once\n#include <cstdint>\nusing UInt8=uint8_t;using UInt16=uint16_t;using UInt32=uint32_t;using UInt64=uint64_t;\n')
+    util = WORK / 'stubs/Headers'
+    util.mkdir(parents=True, exist_ok=True)
+    (util / 'kern_util.hpp').write_text('#pragma once\n#include <IOKit/IOTypes.h>\n')
+    source = (ROOT / 'NootedRed/MetalPatch.cpp').read_text()
+    body = re.split(r'namespace\s*\{', source, maxsplit=1)[1]
+    body = re.split(r'}\s*// namespace', body, maxsplit=1)[0]
+    body = with_memory_helpers(body)
+    template = (ROOT / 'tests/MetalPatch/fixtures/kernel-stubs.cpp.in').read_text()
+    preamble = template
+    harness = preamble + r'''
+#include "cache-fixture.hpp"
+#include <MetalPatch/Data/SubmitGuard.hpp>
+// 同时写入 Scratch 与原生提交方法；后者用于满足提交守卫闸门。
+static constexpr MetalPatch::CacheResolver::Function ScratchAndSubmitFunctions[] = {
+    MetalPatch::Data::ScratchResolverData::ResolverFunctions[0],
+    MetalPatch::ConstructorData::Submit::ResolverFunctions[0],
+};
+static void preinstallSubmitGuard(){
+ const auto method=functionAddresses[1];
+ constexpr uint64_t guardAddress=0x600000;
+ uint8_t payload[sizeof(MetalPatch::SubmitGuard::Payload)];
+ memcpy(payload,MetalPatch::SubmitGuard::Payload,sizeof(payload));
+ const uint64_t continuation=method+MetalPatch::SubmitGuard::MethodPatchSize;
+ memcpy(payload+MetalPatch::SubmitGuard::PayloadJumpOffset,&continuation,sizeof(continuation));
+ blocks[guardAddress].resize(4096);put(guardAddress,payload,sizeof(payload));
+ protections[guardAddress]=5;
+ uint8_t entry[15]={0xff,0x25,0,0,0,0};memcpy(entry+6,&guardAddress,sizeof(guardAddress));entry[14]=0x90;
+ put(method,entry,sizeof(entry));
+}
+namespace Buffer {
+template<class T>T* create(size_t count){return new T[count];}
+template<class T>void deleter(T* pointer){delete[] pointer;}
+}
+constexpr int KERN_INVALID_ADDRESS=1,KERN_PROTECTION_FAILURE=2,VM_FLAGS_ANYWHERE=1;
+using vm_address_t=uint64_t;
+static kern_return_t vm_allocate(vm_map_t,vm_address_t* page,unsigned,int){*page=0;return KERN_FAILURE;}
+static kern_return_t vm_deallocate(vm_map_t,vm_address_t,unsigned){return KERN_SUCCESS;}
+static int proc_pid(proc_t);static void proc_name(int,char*,int);
+static kern_return_t vm_protect(vm_map_t,uint64_t a,unsigned,int setMax,int flags){
+ protects++;if(protects==failedProtect || failedProtectCalls.contains(protects))return 42;assert(protections.contains(a));
+ if(setMax)protections[a]&=flags&7;else protections[a]=flags&7;return 0;}
+BODY
+static int original(proc_t,SharedRegionCheckArgs*,int* value){*value=123;return 0;}
+static int proc_pid(proc_t){return 217;}static void proc_name(int,char* name,int size){snprintf(name,size,"Weather");}
+static vm_map_t map(task_t){return reinterpret_cast<void*>(2);}
+static kern_return_t query(vm_map_t,uint64_t* a,uint64_t* size,unsigned*,int* p,unsigned* count){
+ assert(*count==VM_REGION_SUBMAP_SHORT_INFO_COUNT_64);auto*i=reinterpret_cast<vm_region_submap_short_info_data_64_t*>(p);
+ i->protection=protections.at(*a);i->is_submap=0;*size=4096;return 0;}
+static uint64_t initAddress,overrideAddress,constructorAddress,settingsAddress,dumpAddress;
+static void setup(unsigned id){
+ using namespace MetalPatch::Data;
+ cache(ScratchResolverData::ResolverImages,ScratchAndSubmitFunctions,true);preinstallSubmitGuard();
+ NRed::device=id;devicePatches=findDevice(id);assert(devicePatches);renderRequested=computeScratch=legacyBlend=srdShared=true;submitGuard=true;
+ auto image=imageAddresses[0];initAddress=image+0x21f80;overrideAddress=image+0x23ff8;constructorAddress=image+0x28fe5;
+ settingsAddress=image+0x26000;dumpAddress=image+0x27000;
+ put(initAddress,Original0,sizeof(Original0));put(overrideAddress,Original1,sizeof(Original1));
+ put(constructorAddress,BlendConstructor,sizeof(BlendConstructor));put(settingsAddress,NativeOverride,sizeof(NativeOverride));
+ put(dumpAddress,NativeDump,sizeof(NativeDump));word32(image+0x71064,0x40400000);
+ uint64_t targets[]={image+0x71064,settingsAddress,dumpAddress};
+ for(auto link:OriginalInitLinks)rel(initAddress,link.offset,targets[link.target]);rel(overrideAddress,6,settingsAddress);
+ published={};seenStages=appliedCount=errorCount=windowServerCount=weatherCount=0;
+ originalCheck=reinterpret_cast<uint64_t>(original);readUser=reader;writeUser=writer;getTaskMap=map;queryRegion=query;
+}
+static void call(){SharedRegionCheckArgs args{0x1000};int value=0;assert(wrappedSharedRegionCheck(reinterpret_cast<void*>(217),&args,&value)==0&&value==123);}
+int main(){
+ unsigned cases=0;
+ // 已撤回的 VT 完整函数不再是 Scratch 解析输入；正例只依赖 AMD Scratch。
+ assert(sizeof(MetalPatch::Data::ScratchResolverData::ResolverImages)/
+        sizeof(MetalPatch::Data::ScratchResolverData::ResolverImages[0])==4);
+ assert(sizeof(MetalPatch::Data::ScratchResolverData::ResolverFunctions)/
+        sizeof(MetalPatch::Data::ScratchResolverData::ResolverFunctions[0])==1);
+ for(auto device:MetalPatch::Data::DevicePatches){
+  setup(device.deviceID);MetalPatch::Resolver::Plan plan;
+  assert(MetalPatch::Resolver::resolve(reader,base,device,true,true,plan,true));
+  assert(plan.patches[3].offset+base==functionAddresses[0]);
+  pages(plan.patches,4);assert(protections.size()==9);auto initial=blocks;
+  call();if(!properties.contains("NRedImmediateSyncDynamicApplied")){for(auto[k,v]:properties)fprintf(stderr,"%s=%u\n",k.c_str(),v);}assert(properties.contains("NRedImmediateSyncDynamicApplied")&&properties.at("NRedComputeScratchWeatherApplied")==1);assert(properties.at("NRedDisplayVPFPlanVerified")==1&&properties.at("NRedDisplayVPFPlanSites")==4);rx();assert(writes==4);
+  for(unsigned i=0;i<4;i++){uint8_t b[MetalPatch::Data::MaxPatchSize];assert(reader(base+plan.patches[i].offset,b,plan.patches[i].size)==0);assert(memcmp(b,plan.patches[i].patched,plan.patches[i].size)==0);}
+  auto before=writes;call();assert(writes==before&&properties.at("NRedImmediateSyncD07")==1);cases++;
+  for(unsigned entry=1;entry<=4;entry++){
+   setup(device.deviceID);pages(plan.patches,4);initial=blocks;failWrite=entry;call();assert(blocks==initial);rx();assert(!properties.contains("NRedImmediateSyncDynamicApplied"));cases++;
+  }
+  for(unsigned page=1;page<=8;page++){
+   setup(device.deviceID);pages(plan.patches,4);initial=blocks;failedProtect=page;call();assert(blocks==initial&&writes==0);rx();cases++;
+  }
+  setup(device.deviceID);pages(plan.patches,4);initial=blocks;failedProtectCalls={9,10};call();assert(blocks==initial);rx();cases++;
+ }
+ for(unsigned kind=0;kind<8;kind++){
+  setup(0x15e7);using namespace MetalPatch::Data::ScratchResolverData;
+  switch(kind){
+   case 0:word32(functionAddresses[0]+100,0);break;
+   case 1:word64(base+0x7000000,0);break;
+   case 2:rel(functionAddresses[0],ResolverFunctions[0].originalRefs[0].offset,base+0x7100000);break;
+   case 3:word32(base+452,8193);break;
+   case 4:{std::vector<uint8_t>b(ResolverFunctions[0].size);assert(reader(functionAddresses[0],b.data(),b.size())==0);put(imageAddresses[0]+0x60000,b.data(),b.size());}break;
+   case 5:word32(constructorAddress+MetalPatch::Data::BlendGateInConstructor,0);break;
+   case 6:word32(base+0x3000,0);break;
+   case 7:failedRead=functionAddresses[0];break;
+  }
+  auto initial=blocks;call();assert(blocks==initial&&writes==0&&protects==0);cases++;
+ }
+ printf("PASS %u compute dynamic bridge cases: six devices; relocated scratch/GOT; eight-page rollback\n",cases);
+}
+'''
+    if LEGACY:
+        start = harness.index('static uint64_t initAddress')
+        harness = harness[:start] + (ROOT / 'tests/MetalPatch/fixtures/sequoia-surface-dynamic.cpp.in').read_text()
+        harness = harness.replace('static kern_return_t vm_allocate(vm_map_t,vm_address_t* page,unsigned,int){*page=0;return KERN_FAILURE;}',
+            'static kern_return_t vm_allocate(vm_map_t,vm_address_t* page,unsigned,int){'
+            '*page=0x600000;blocks[*page].resize(4096);protections[*page]=3;return 0;}')
+        harness = harness.replace('static kern_return_t vm_deallocate(vm_map_t,vm_address_t,unsigned){return KERN_SUCCESS;}',
+            'static kern_return_t vm_deallocate(vm_map_t,vm_address_t page,unsigned){blocks.erase(page);protections.erase(page);return 0;}')
+    if LEGACY:
+        harness = harness.replace('renderRequested = computeScratch', f'Version::majorValue={23 if SONOMA else 24}; renderRequested = computeScratch')
+    if SONOMA:
+        harness = harness.replace('MetalPatch::SequoiaData', 'MetalPatch::SonomaData')
+        harness = harness.replace('MetalPatch::Resolver::resolveSequoia(reader, base, device.deviceID, plan)',
+            '([&]{plan.input={reader,{}};plan.input.scanBuffer=plan.scan;return MetalPatch::Resolver::resolveMetal(plan.input,base,device.deviceID,plan,23);}())')
+    if SONOMA:
+        for value in ('offset', 'failedOffset'):
+            harness = harness.replace(f'MetalPatch::Resolver::resolveSequoiaSubmit(reader, base, {value})',
+                f'([&]{{MetalPatch::SharedCache::Input in{{reader,{{}}}};return MetalPatch::Resolver::resolveSubmitForOS(in,base,{value},23);}}())')
+        harness = harness.replace(')), 24, 0x1638', ')), 23, 0x1638')
+    if SONOMA:
+        harness = harness.replace('Sequoia display cases', 'Sonoma display cases')
+    uuid = ('MetalPatch::SonomaData::CacheUUID' if SONOMA else 'MetalPatch::SequoiaData::CacheUUID') if LEGACY else 'MetalPatch::Data::CacheUUID'
+    harness = harness.replace('BODY', 'static bool referenceUUID=false;\nBODY')
+    harness = harness.replace('preinstallSubmitGuard();', f'preinstallSubmitGuard();if(referenceUUID)put(base+88,{uuid},16);')
+    harness = harness.replace('int main(){', 'int main(int argc,char**){referenceUUID=argc>1;')
+    harness = harness.replace('int main()\n{', 'int main(int argc,char**)\n{\n    referenceUUID=argc>1;')
+    harness = harness.replace('BODY', body)
+    file, exe = WORK / 'test.cpp', WORK / 'test'
+    file.write_text(harness)
+    flags = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if '--sanitize' in sys.argv else []
+    subprocess.run(['clang++', '-std=c++23', '-O2', *flags, '-I'+str(WORK/'stubs'),
+                    '-I'+str(ROOT/'NootedRed'), '-I'+str(ROOT/'tests/MetalPatch/fixtures'), str(file), '-o', str(exe)], check=True, timeout=180)
+    if '--known-uuid' not in sys.argv:
+        subprocess.run([str(exe)], check=True, timeout=180)
+    subprocess.run([str(exe), '--known-uuid'], check=True, timeout=180)
+
+
+if __name__ == '__main__':
+    main()
